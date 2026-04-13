@@ -1,7 +1,7 @@
-#!/usr/bin/env node
-
+import express from "express";
+import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { GongClient } from "./gong-client.js";
 import type {
@@ -16,9 +16,16 @@ import type {
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
+const PORT = parseInt(process.env.PORT ?? "8080", 10);
+const MCP_API_KEY = process.env.MCP_API_KEY;
 const GONG_BASE_URL = process.env.GONG_BASE_URL ?? "https://us-11858.api.gong.io";
 const GONG_ACCESS_KEY = process.env.GONG_ACCESS_KEY;
 const GONG_ACCESS_KEY_SECRET = process.env.GONG_ACCESS_KEY_SECRET;
+
+if (!MCP_API_KEY) {
+  console.error("Missing required env var: MCP_API_KEY");
+  process.exit(1);
+}
 
 if (!GONG_ACCESS_KEY || !GONG_ACCESS_KEY_SECRET) {
   console.error(
@@ -207,12 +214,9 @@ function formatAnsweredScorecard(as: AnsweredScorecard): string {
   return lines.join("\n");
 }
 
-// ── MCP Server ─────────────────────────────────────────────────────────────
+// ── MCP Tool Registration ─────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: "gong-mcp",
-  version: "1.0.0",
-});
+function registerTools(server: McpServer): void {
 
 // ── Tool: list_users ──
 
@@ -449,14 +453,83 @@ server.tool(
   }
 );
 
-// ── Start ──────────────────────────────────────────────────────────────────
+} // end registerTools
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+// ── HTTP Server ───────────────────────────────────────────────────────────
+
+const app = express();
+app.use(express.json());
+
+// Health check (unauthenticated)
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok" });
+});
+
+// API Key authentication middleware for MCP endpoints
+function authenticateApiKey(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+): void {
+  const key = req.headers["x-api-key"] as string | undefined;
+  if (!key || key !== MCP_API_KEY) {
+    res.status(401).json({ error: "Unauthorized: invalid or missing x-api-key header" });
+    return;
+  }
+  next();
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
+// Session management: map session IDs to transports
+const sessions = new Map<string, StreamableHTTPServerTransport>();
+
+// Handle MCP requests (POST, GET for SSE, DELETE for session close)
+app.all("/mcp", authenticateApiKey, async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  if (req.method === "GET" || req.method === "DELETE") {
+    // GET (SSE listen) and DELETE (session close) require an existing session
+    const transport = sessionId ? sessions.get(sessionId) : undefined;
+    if (!transport) {
+      res.status(400).json({ error: "No valid session. Send an initialize request first." });
+      return;
+    }
+    await transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // POST: either route to an existing session or create a new one on initialize
+  if (sessionId && sessions.has(sessionId)) {
+    const transport = sessions.get(sessionId)!;
+    await transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // New session: create transport + server instance
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id) => {
+      sessions.set(id, transport);
+      console.log(`Session created: ${id} (active: ${sessions.size})`);
+    },
+    onsessionclosed: (id) => {
+      sessions.delete(id);
+      console.log(`Session closed: ${id} (active: ${sessions.size})`);
+    },
+  });
+
+  // Create a fresh MCP server bound to this session
+  const sessionServer = createMcpServer();
+  await sessionServer.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+});
+
+// Factory that registers all Gong tools on a new McpServer instance
+function createMcpServer(): McpServer {
+  const s = new McpServer({ name: "gong-mcp", version: "1.0.0" });
+  registerTools(s);
+  return s;
+}
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Gong MCP server listening on http://0.0.0.0:${PORT}/mcp`);
 });
