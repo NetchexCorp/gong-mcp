@@ -49,11 +49,14 @@ ACR_PASSWORD=$(az acr credential show -n "$ACR_NAME" -g "$RESOURCE_GROUP" --quer
 
 echo "==> Deploying Container App..."
 if az containerapp show -n "$APP_NAME" -g "$RESOURCE_GROUP" &>/dev/null; then
-  # Update existing app with new image and secrets
+  # Update existing app with new image, secrets, and keep min-replicas=1
+  # so a warm instance is always available (avoids ~10-30s cold-start latency).
   az containerapp update \
     --name "$APP_NAME" \
     --resource-group "$RESOURCE_GROUP" \
     --image "$IMAGE_TAG" \
+    --min-replicas 1 \
+    --max-replicas 1 \
     --set-env-vars \
       MCP_API_KEY=secretref:mcp-api-key \
       GONG_ACCESS_KEY=secretref:gong-access-key \
@@ -65,7 +68,8 @@ if az containerapp show -n "$APP_NAME" -g "$RESOURCE_GROUP" &>/dev/null; then
       gong-access-key-secret="$GONG_ACCESS_KEY_SECRET" \
       gong-base-url="$GONG_BASE_URL"
 else
-  # Create new app
+  # Create new app. min-replicas=1 keeps an instance warm; the server itself
+  # emits SSE keepalive comments to defeat Azure's 4-minute ingress idle timeout.
   az containerapp create \
     --name "$APP_NAME" \
     --resource-group "$RESOURCE_GROUP" \
@@ -76,7 +80,7 @@ else
     --registry-password "$ACR_PASSWORD" \
     --target-port 8080 \
     --ingress external \
-    --min-replicas 0 \
+    --min-replicas 1 \
     --max-replicas 1 \
     --env-vars \
       MCP_API_KEY=secretref:mcp-api-key \

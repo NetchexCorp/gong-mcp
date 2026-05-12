@@ -482,8 +482,48 @@ function authenticateApiKey(
 // Session management: map session IDs to transports
 const sessions = new Map<string, StreamableHTTPServerTransport>();
 
+// Azure Container Apps default ingress disconnects idle HTTP streams after
+// 4 minutes. SSE responses go idle whenever the client isn't actively waiting
+// on a tool result, so we inject a `: keepalive` comment every 25 seconds —
+// the colon-prefixed line is a valid SSE comment that the client discards,
+// but it counts as traffic for the load balancer's idle clock.
+const SSE_KEEPALIVE_INTERVAL_MS = 25_000;
+
+function installSseKeepalive(res: express.Response): void {
+  let interval: NodeJS.Timeout | null = null;
+  const stop = (): void => {
+    if (interval) {
+      clearInterval(interval);
+      interval = null;
+    }
+  };
+
+  const origWriteHead = res.writeHead.bind(res);
+  res.writeHead = function patched(this: express.Response, ...args: unknown[]) {
+    const result = (origWriteHead as (...a: unknown[]) => express.Response).apply(this, args);
+    const ct = res.getHeader("content-type");
+    const isSse = typeof ct === "string" && ct.toLowerCase().includes("text/event-stream");
+    if (isSse && !interval) {
+      interval = setInterval(() => {
+        if (res.writableEnded || res.destroyed) {
+          stop();
+          return;
+        }
+        res.write(`: keepalive ${Date.now()}\n\n`);
+      }, SSE_KEEPALIVE_INTERVAL_MS);
+      interval.unref?.();
+    }
+    return result;
+  } as typeof res.writeHead;
+
+  res.on("close", stop);
+  res.on("finish", stop);
+}
+
 // Handle MCP requests (POST, GET for SSE, DELETE for session close)
 app.all("/mcp", authenticateApiKey, async (req, res) => {
+  installSseKeepalive(res);
+
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
   if (req.method === "GET" || req.method === "DELETE") {
