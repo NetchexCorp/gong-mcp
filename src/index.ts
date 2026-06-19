@@ -1,5 +1,4 @@
 import express from "express";
-import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -479,9 +478,6 @@ function authenticateApiKey(
   next();
 }
 
-// Session management: map session IDs to transports
-const sessions = new Map<string, StreamableHTTPServerTransport>();
-
 // Azure Container Apps default ingress disconnects idle HTTP streams after
 // 4 minutes. SSE responses go idle whenever the client isn't actively waiting
 // on a tool result, so we inject a `: keepalive` comment every 25 seconds —
@@ -520,48 +516,66 @@ function installSseKeepalive(res: express.Response): void {
   res.on("finish", stop);
 }
 
-// Handle MCP requests (POST, GET for SSE, DELETE for session close)
-app.all("/mcp", authenticateApiKey, async (req, res) => {
+// Stateless MCP: a fresh transport + server instance per POST request.
+//
+// The earlier design tracked sessions in an in-memory Map keyed by
+// `mcp-session-id`. Azure Container Apps recycles the replica periodically
+// (node maintenance) and may scale horizontally, both of which wiped or
+// fragmented that Map — clients holding a now-unknown session id then failed to
+// reconnect with JSON-RPC error -32000. Running the transport stateless
+// (`sessionIdGenerator: undefined`) removes server-side session state entirely:
+// every POST is self-contained, so pod recycles and scaling become invisible to
+// clients. This server only does request/response tool calls (no
+// server-initiated notifications), so stateless mode costs nothing.
+app.post("/mcp", authenticateApiKey, async (req, res) => {
   installSseKeepalive(res);
 
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-  if (req.method === "GET" || req.method === "DELETE") {
-    // GET (SSE listen) and DELETE (session close) require an existing session
-    const transport = sessionId ? sessions.get(sessionId) : undefined;
-    if (!transport) {
-      res.status(400).json({ error: "No valid session. Send an initialize request first." });
-      return;
-    }
-    await transport.handleRequest(req, res, req.body);
-    return;
-  }
-
-  // POST: either route to an existing session or create a new one on initialize
-  if (sessionId && sessions.has(sessionId)) {
-    const transport = sessions.get(sessionId)!;
-    await transport.handleRequest(req, res, req.body);
-    return;
-  }
-
-  // New session: create transport + server instance
+  const server = createMcpServer();
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: (id) => {
-      sessions.set(id, transport);
-      console.log(`Session created: ${id} (active: ${sessions.size})`);
-    },
-    onsessionclosed: (id) => {
-      sessions.delete(id);
-      console.log(`Session closed: ${id} (active: ${sessions.size})`);
-    },
+    sessionIdGenerator: undefined,
   });
 
-  // Create a fresh MCP server bound to this session
-  const sessionServer = createMcpServer();
-  await sessionServer.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  // Tear down the per-request instances once the response is done.
+  res.on("close", () => {
+    void transport.close();
+    void server.close();
+  });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("Error handling MCP request:", err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
+  }
 });
+
+// A stateless server exposes no standalone SSE stream and no session lifecycle,
+// so GET (SSE listen) and DELETE (session close) have nothing to act on. Per the
+// MCP spec, a server that offers no GET SSE stream returns 405 Method Not
+// Allowed — this tells the client up front not to wait on a session-based
+// reconnect that will never exist (which is what produced the -32000 errors).
+function methodNotAllowed(_req: express.Request, res: express.Response): void {
+  res
+    .status(405)
+    .set("Allow", "POST")
+    .json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32000,
+        message: "Method not allowed: this MCP server is stateless; use POST.",
+      },
+      id: null,
+    });
+}
+app.get("/mcp", authenticateApiKey, methodNotAllowed);
+app.delete("/mcp", authenticateApiKey, methodNotAllowed);
 
 // Factory that registers all Gong tools on a new McpServer instance
 function createMcpServer(): McpServer {

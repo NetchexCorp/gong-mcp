@@ -18,7 +18,16 @@ LOCATION="eastus"
 ACR_NAME="doldataacr"
 APP_NAME="gong-mcp"
 ENVIRONMENT_NAME="doldata-env"
-IMAGE_TAG="${ACR_NAME}.azurecr.io/${APP_NAME}:latest"
+
+# Use a UNIQUE image tag per deploy. A fixed `:latest` tag makes
+# `az containerapp update` a no-op — the revision template string is unchanged,
+# so Azure never rolls a new revision and keeps serving the old image digest.
+# A unique tag (git SHA + timestamp) guarantees the template changes and a fresh
+# revision is created that pulls the new image. We also push `:latest` for
+# humans, but the deploy references the unique tag.
+GIT_SHA="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+IMAGE_VERSION="${GIT_SHA}-$(date +%Y%m%d%H%M%S)"
+IMAGE_TAG="${ACR_NAME}.azurecr.io/${APP_NAME}:${IMAGE_VERSION}"
 
 echo "==> Ensuring Container App Environment exists..."
 if ! az containerapp env show -n "$ENVIRONMENT_NAME" -g "$RESOURCE_GROUP" &>/dev/null; then
@@ -37,10 +46,11 @@ if ! az acr show -n "$ACR_NAME" -g "$RESOURCE_GROUP" &>/dev/null; then
     --admin-enabled true
 fi
 
-echo "==> Building and pushing image to ACR..."
+echo "==> Building and pushing image to ACR (tags: ${IMAGE_VERSION}, latest)..."
 az acr build \
   --registry "$ACR_NAME" \
   --resource-group "$RESOURCE_GROUP" \
+  --image "${APP_NAME}:${IMAGE_VERSION}" \
   --image "${APP_NAME}:latest" \
   .
 
